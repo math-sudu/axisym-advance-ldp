@@ -151,10 +151,10 @@ def extract_run(run, material_pair_z):
     }
 
 
-def build(data):
+def build(data, schedules=SCHEDULES, section_path=SECTION_SOURCE):
     runs = []
-    for case in SCHEDULES:
-        source_runs = select_runs(data, case)
+    for case in schedules:
+        source_runs = select_runs(data, case, schedules)
         baseline = source_runs[0]
         pair = control_pair(baseline)
         pair_z = [baseline["sections"][pair[key]]["z_over_a"] for key in ("low_index", "high_index")]
@@ -164,7 +164,7 @@ def build(data):
             print(json.dumps({"case": case, "target": run["installation_target_over_a"],
                               "round": run["round_length_over_a"], **result["summary"]}), flush=True)
     return {
-        "section_history_source": SECTION_SOURCE.relative_to(ROOT).as_posix(),
+        "section_history_source": section_path.relative_to(ROOT).as_posix(),
         "operator_source": "src/wave2_src/axifem.py",
         "radius_m": A, "lining_modulus_MPa": E_L, "lining_poisson_ratio": NU_L,
         "lambda_MPa": LAM, "mu_MPa": MU,

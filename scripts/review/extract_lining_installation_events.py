@@ -31,8 +31,17 @@ def relative(path):
     return Path(path).relative_to(ROOT).as_posix()
 
 
+def round_count(final_face, round_length):
+    if not np.isfinite([final_face, round_length]).all() or min(final_face, round_length) <= 0:
+        raise ValueError("Advance length and round length must be finite and positive")
+    count = round(final_face / round_length)
+    if not np.isclose(count * round_length, final_face, rtol=0, atol=1e-10):
+        raise ValueError("The target face must end a complete construction round")
+    return count
+
+
 def extract_run(source, case, nominal_distance, mesh_level, round_length,
-                initial_state=None):
+                initial_state=None, final_face=12.0):
     initial_state = initial_state or source / "step-000.npz"
     previous = read_state(initial_state)
     np.testing.assert_allclose(previous["face_over_a"], 0.0)
@@ -42,7 +51,7 @@ def extract_run(source, case, nominal_distance, mesh_level, round_length,
         raise ValueError("The positive-z cohort is already lined at spin-up")
     initial_front = float(hi[previous["liner_active"]].max())
     events = []
-    final_step = round(12 / round_length)
+    final_step = round_count(final_face, round_length)
     for step in range(1, final_step + 1):
         current = read_state(source / f"step-{step:03d}.npz")
         face, reference_face = current["face_over_a"], previous["face_over_a"]
@@ -81,7 +90,7 @@ def extract_run(source, case, nominal_distance, mesh_level, round_length,
                 "first_loaded_edge_distance_over_a": face - z1,
             })
         previous = current
-    np.testing.assert_allclose(previous["face_over_a"], 12.0)
+    np.testing.assert_allclose(previous["face_over_a"], final_face)
     events.sort(key=lambda event: event["band_over_a"][0])
     edges = np.asarray([event["band_over_a"] for event in events])
     np.testing.assert_allclose(edges[[0, -1], [0, 1]], COHORT)
@@ -92,6 +101,7 @@ def extract_run(source, case, nominal_distance, mesh_level, round_length,
         "mesh_level": mesh_level,
         "nominal_distance_over_a": nominal_distance,
         "round_length_over_a": round_length,
+        "final_face_over_a": final_face,
         "installation_target_over_a": nominal_distance - round_length,
         "initial_state": relative(initial_state),
         "initial_lining_front_over_a": initial_front,

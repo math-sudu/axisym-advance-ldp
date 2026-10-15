@@ -4,8 +4,9 @@ from __future__ import annotations
 import numpy as np
 
 from wave2_src import axifem, scenario as scen
-from runtime import (RefinementCoupled, load_npz, mc_sorted_roundoff, newton,
-                     subdivide)
+from runtime import (RefinementCoupled, construction_axial_lines, load_npz,
+                     mc_sorted_roundoff, newton, subdivide)
+from extract_lining_installation_events import round_count
 
 
 class AdvanceSolver(RefinementCoupled):
@@ -16,14 +17,19 @@ class AdvanceSolver(RefinementCoupled):
         return super().solve_step(*args, **kwargs)
 
 
-def build(case, level=1):
+def build(case, level=1, *, axial_track_spacing_over_a=None, final_face_over_a=12.0,
+          axial_event_positions_over_a=()):
     axifem._mc_sorted = mc_sorted_roundoff
     radial, axial = scen.radial_lines, scen.axial_lines
     scen.radial_lines = lambda *a, **k: subdivide(radial(*a, **k), level)
-    scen.axial_lines = lambda *a, **k: subdivide(axial(*a, **k), level)
+    scen.axial_lines = lambda *a, **k: construction_axial_lines(
+        subdivide(axial(*a, **k), level), axial_track_spacing_over_a, scen.A,
+        final_face_over_a + 2.6, axial_event_positions_over_a)
     try:
         model = scen.AdvanceScenario(scen.ARMS[case], liner_d=scen.A,
-                                     n_ord=8, h_scale=1.0, tol_rel=1e-6)
+                                     n_ord=8, h_scale=1.0, tol_rel=1e-6,
+                                     L_adv=final_face_over_a * scen.A,
+                                     anchor_x_f=12 * scen.A)
     finally:
         scen.radial_lines, scen.axial_lines = radial, axial
     old = model.solver
@@ -33,14 +39,19 @@ def build(case, level=1):
     return model
 
 
-def configure(model, gap, round_length):
+def configure(model, gap, round_length, final_face=12.0):
+    if not np.isfinite(gap) or gap < 0:
+        raise ValueError("Installation gap must be finite and nonnegative")
     model.dstep = round_length * scen.A
-    model.n_steps = round(12 / round_length)
+    model.n_steps = round_count(final_face, round_length)
     model.liner_d = round(gap + round_length, 12) * scen.A
     for face in np.arange(1, model.n_steps + 1) * model.dstep:
         for position in (face, face - model.liner_d):
             if not np.isclose(model.z_lines, position, rtol=0, atol=1e-9).any():
                 raise ValueError("Construction endpoint is not a mesh boundary")
+    edges = model.mesh.e_z1[model.fe.blocks["liner"]["elems"]]
+    if edges.max() < (final_face - gap - round_length) * scen.A - 1e-9:
+        raise ValueError("The lining does not cover the final installation event")
 
 
 def restore(model, path):

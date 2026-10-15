@@ -160,10 +160,11 @@ def extract_run(run, band_run, bands):
     }
 
 
-def build(events, band_histories):
+def build(events, band_histories, schedules=SCHEDULES, events_path=EVENTS, bands_path=SOURCE):
     runs = []
-    for case in SCHEDULES:
-        for event_run, band_run in zip(select_runs(events, case), select_runs(band_histories, case), strict=True):
+    for case in schedules:
+        for event_run, band_run in zip(select_runs(events, case, schedules),
+                                       select_runs(band_histories, case, schedules), strict=True):
             for key in ("source_directory", "initial_state"):
                 if event_run[key] != band_run[key]:
                     raise ValueError(f"Installation and band histories disagree on {key}")
@@ -174,13 +175,14 @@ def build(events, band_histories):
     return {
         **{key: band_histories[key] for key in ("radius_m", "cohort_over_a", "final_face_over_a",
                                                "evaluation_basis")},
-        "installation_events": EVENTS.relative_to(ROOT).as_posix(),
-        "band_history_source": SOURCE.relative_to(ROOT).as_posix(),
+        "installation_events": events_path.relative_to(ROOT).as_posix(),
+        "band_history_source": bands_path.relative_to(ROOT).as_posix(),
         "definitions": {
             "section_thrust": "Thickness integral of -sigma_tt at each stored axial Gauss position; "
                               "each radial Gauss point has weight h_r/2, without radius weighting.",
             "demand_envelope": "Maximum over fixed axial Gauss sections in z/a=[3,6] and saved "
-                               "round equilibria from each section's stress-free installation to x_f/a=12.",
+                               f"round equilibria from each section's stress-free installation to "
+                               f"x_f/a={band_histories['final_face_over_a']:g}.",
             "installation": "Zero thrust at the preceding equilibrium used as the activation reference. "
                             "Earlier thrust entries are null. Batch bounds come from the actual active-mask transition.",
             "cohort_mean": "Axial Gauss weights h_z/2, normalized by the cohort length; "

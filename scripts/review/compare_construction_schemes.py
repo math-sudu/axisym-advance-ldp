@@ -49,9 +49,9 @@ def allowance_map(schemes):
     }
 
 
-def select_runs(data, case):
+def select_runs(data, case, schedules=SCHEDULES):
     selected = []
-    for target, step in SCHEDULES[case]:
+    for target, step in schedules[case]:
         matches = [run for run in data["runs"]
                    if run["case"] == case and run["mesh_level"] == 1
                    and isclose(run["installation_target_over_a"], target)

@@ -5,8 +5,9 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
+from contextlib import contextmanager
 from fedev_src.material import lame, _compliance
-from wave2_src import scenario as scen
+from wave2_src import axifem, scenario as scen
 from wave2_src.coupling import CoupledSolver
 
 REFINEMENT_MAX_FAILED_ATTEMPTS = 60
@@ -34,6 +35,24 @@ def subdivide(lines, level):
     return np.concatenate([np.concatenate([
         np.linspace(lo, hi, n, endpoint=False) for lo, hi in zip(lines[:-1], lines[1:])
     ]), lines[-1:]])
+
+
+def construction_axial_lines(lines, spacing_over_a, radius, track_end_over_a=14.6,
+                             event_positions_over_a=()):
+    """Refine the construction track while retaining the exterior mesh lines."""
+    if spacing_over_a is None:
+        return lines
+    if not np.isfinite(spacing_over_a) or spacing_over_a <= 0:
+        raise ValueError("Axial spacing must be finite and positive")
+    count = round((track_end_over_a + 2.0) / spacing_over_a)
+    if not np.isclose(count * spacing_over_a, track_end_over_a + 2.0):
+        raise ValueError("Axial spacing must divide the construction track")
+    track = np.round(np.linspace(-2.0, track_end_over_a, count + 1), 10) * radius
+    outside = lines[(lines < -2 * radius - 1e-9) | (lines > track_end_over_a * radius + 1e-9)]
+    events = np.asarray(event_positions_over_a, dtype=float)
+    if not np.isfinite(events).all() or np.any(events < -2.0) or np.any(events > track_end_over_a):
+        raise ValueError("Construction events must lie inside the refined axial track")
+    return np.unique(np.concatenate((outside, track, events * radius)))
 
 
 def save_npz(path, meta, arrays):
@@ -188,6 +207,21 @@ def mc_sorted_roundoff(s1, s2, s3, E, nu, c, phi, psi, visc_H=0.0):
     region = (sel_face.to(torch.int64) + 2 * sel_right.to(torch.int64)
               + 3 * sel_left.to(torch.int64) + 4 * sel_apex.to(torch.int64))
     return t1, t2, t3, e1, e2, e3, dlam, region
+
+@contextmanager
+def corrected_kernel():
+    old = axifem._mc_sorted
+    axifem._mc_sorted = mc_sorted_roundoff
+    try:
+        yield
+    finally:
+        axifem._mc_sorted = old
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.part")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 class RefinementCoupled(CoupledSolver):
     """Traced pinned solver with refinement-appropriate ramp guards.

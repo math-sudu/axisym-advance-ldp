@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from extract_lining_installation_events import A, COHORT, ROOT, read_state
+from extract_lining_installation_events import A, COHORT, ROOT, read_state, round_count
 
 EVENTS = ROOT / "results/analysis/lining_activation/installation_events.json"
 OUT = ROOT / "results/analysis/lining_activation/fixed_band_histories.json"
@@ -85,7 +85,8 @@ def extract_run(run, bands):
     np.testing.assert_allclose([thickness[selected].sum() for selected in selectors], 0.2)
     reference = np.zeros(len(bands))
     rows, convergence, thrusts, faces = [], [], [], []
-    final_step = round(FINAL_FACE / run["round_length_over_a"])
+    final_face = run.get("final_face_over_a", FINAL_FACE)
+    final_step = round_count(final_face, run["round_length_over_a"])
     for step in range(final_step + 1):
         path = (ROOT / run["initial_state"] if step == 0
                 else ROOT / run["source_directory"] / f"step-{step:03d}.npz")
@@ -155,6 +156,7 @@ def extract_run(run, bands):
                                    "round_length_over_a", "installation_target_over_a",
                                    "source_directory", "initial_state")},
         "construction_rounds": final_step,
+        "final_face_over_a": final_face,
         "cohort_fully_installed_face_over_a": float(faces[full_installation_steps.max()]),
         "band_installation": installation,
         "history": rows,
@@ -182,16 +184,20 @@ def build(events_path):
     np.testing.assert_allclose(event_data["cohort_over_a"], COHORT)
     edges = np.round(np.linspace(*COHORT, round((COHORT[1] - COHORT[0]) / WIDTH) + 1), 10)
     bands = np.column_stack((edges[:-1], edges[1:]))
+    final_faces = {run.get("final_face_over_a", FINAL_FACE) for run in event_data["runs"]}
+    if len(final_faces) != 1:
+        raise ValueError("Compared histories must share a common final face")
+    final_face = final_faces.pop()
     return {
         "radius_m": A, "cohort_over_a": list(COHORT), "band_width_over_a": WIDTH,
-        "bands_over_a": bands.tolist(), "final_face_over_a": FINAL_FACE,
+        "bands_over_a": bands.tolist(), "final_face_over_a": final_face,
         "evaluation_basis": "common global face position",
         "installation_events": events_path.relative_to(ROOT).as_posix(),
         "definitions": {
             "spatial_readout": "Native Gauss-point hoop stress is integrated through thickness; "
                                "native resultants are averaged by axial overlap length. "
                                "Wall convergence is the band integral of piecewise-linear nodal displacement.",
-            "sampling": "Accepted equilibria from x_f/a=0 through 12, including stress-free "
+            "sampling": f"Accepted equilibria from x_f/a=0 through {final_face:g}, including stress-free "
                         "installation at each accepted face before the next release. "
                         "Every band in a row uses the same actual face position.",
             "installation_reference": "Length average of each constituent section's convergence "
@@ -201,9 +207,9 @@ def build(events_path):
                                     "initial zero displacement, over all saved equilibria including "
                                     "pre-installation states.",
             "demand_envelope": "Maximum over bands and saved equilibria from each band's complete "
-                               "installation to x_f/a=12. Incomplete-band loads are null. "
+                               f"installation to x_f/a={final_face:g}. Incomplete-band loads are null. "
                                "Cohort means and peak-to-mean ratios begin after all bands are installed.",
-            "construction_rounds": "Advance rounds from x_f/a=0 to 12; excludes the initial 10a excavation.",
+            "construction_rounds": f"Advance rounds from x_f/a=0 to {final_face:g}; excludes the initial 10a excavation.",
         },
         "runs": [extract_run(run, bands) for run in event_data["runs"]],
     }

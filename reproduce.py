@@ -24,8 +24,12 @@ torch.set_num_interop_threads(1)
 THREAD_LIMIT = threadpool_limits(limits=1)
 
 from compare_construction_schemes import SCHEDULES
-from runtime import geometry, jsonable, save_npz, state_arrays
+from runtime import geometry, jsonable, np, save_npz, state_arrays
 from solver import build, configure, restore
+
+DESIGN_SCHEDULES = {"B": ((0.6, 0.4), (0.7, 0.2), (0.75, 0.2), (0.8, 0.2))}
+DESIGN_ROOT = ROOT / "results/analysis/lining_activation/construction_design"
+INTERIOR_SCHEDULES = {"B": ((0.6, 0.4), (0.7, 0.2), (0.72, 0.2))}
 
 
 def write_json(path, value):
@@ -35,9 +39,13 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def run_directory(case, gap, length):
+def design_root(interior=False):
+    return DESIGN_ROOT / "interior_position" if interior else DESIGN_ROOT
+
+
+def run_directory(case, gap, length, design=False, interior=False):
     name = f"{case}_g{gap:g}_round{length:g}".replace(".", "p")
-    return ROOT / "results/runs" / name
+    return (design_root(interior) if design else ROOT / "results/runs") / name
 
 
 def advance(model, step, directory):
@@ -53,24 +61,34 @@ def advance(model, step, directory):
                       "seconds": record["wall_s"]}), flush=True)
 
 
-def simulate(case, gap, length, stop_after=None):
+def simulate(case, gap, length, stop_after=None, design=False, interior=False):
     """Generate/reuse the shared spin-up, then resume this schedule."""
-    if (gap, length) not in SCHEDULES[case]:
+    if not design and (gap, length) not in SCHEDULES[case]:
         raise ValueError(f"No manuscript schedule for {(case, gap, length)}")
-    model = build(case)
-    initial_dir = ROOT / "results/runs" / f"{case}_initial"
+    final_face = 14.4 if design else 12.0
+    event_positions = np.round(np.arange(72) * 0.2 - 0.72, 12).tolist() if interior else []
+    model = build(case, axial_track_spacing_over_a=0.05 if design else None,
+                  final_face_over_a=final_face, axial_event_positions_over_a=event_positions)
+    initial_dir = (design_root(interior) if design else ROOT / "results/runs") / f"{case}_initial"
     initial_dir.mkdir(parents=True, exist_ok=True)
     initial = initial_dir / "step-000.npz"
     if not initial.exists():
         advance(model, 0, initial_dir)
     else:
         restore(model, initial)
-    configure(model, gap, length)
-    output = run_directory(case, gap, length)
+    configure(model, gap, length, final_face)
+    output = run_directory(case, gap, length, design, interior)
     output.mkdir(parents=True, exist_ok=True)
     controls = {"case": case, "mesh_level": 1, "installation_target_over_a": gap,
                 "round_length_over_a": length, "cap": 1 / 16, "tol_rel": 1e-6,
                 "initial_state": initial.relative_to(ROOT).as_posix()}
+    if design:
+        controls.update(level=1, axial_track_spacing_over_a=0.05,
+                        axial_track_end_over_a=final_face + 2.6,
+                        final_face_over_a=final_face, exterior_anchor_over_a=12.0,
+                        nominal_distance_over_a=round(gap + length, 12))
+    if interior:
+        controls["axial_event_positions_over_a"] = event_positions
     control_path = output / "controls.json"
     if control_path.exists():
         if json.loads(control_path.read_text(encoding="utf-8")) != controls:
@@ -129,25 +147,44 @@ def main():
     run.add_argument("--gap", type=float, default=0.6, help="Installation front gap / radius")
     run.add_argument("--round-length", type=float, default=0.4, help="Round length / radius")
     run.add_argument("--stop-after", type=int, help="Stop after this completed round for a short run")
-    commands.add_parser("analyse", help="Extract the eight-schedule response and strain histories")
+    run.add_argument("--design", action="store_true", help="Use the 0.05a track and 14.4a design task")
+    run.add_argument("--interior", action="store_true",
+                     help="Use the design geometry containing the 0.72a installation events")
+    analysis = commands.add_parser("analyse", help="Extract response and strain histories")
+    analysis.add_argument("--design", action="store_true")
+    analysis.add_argument("--interior", action="store_true")
     query = commands.add_parser("select", help="Query the generated allowance map")
     query.add_argument("--case", choices=SCHEDULES, required=True)
     query.add_argument("--convergence-mm", type=float, required=True)
     query.add_argument("--thrust-kn-per-m", type=float, required=True)
+    query.add_argument("--design", action="store_true")
+    query.add_argument("--interior", action="store_true")
     args = parser.parse_args()
+    if args.interior:
+        args.design = True
     if args.command == "simulate":
         if args.stop_after is not None and args.stop_after < 1:
             parser.error("--stop-after must be at least 1")
-        schedules = [(case, gap, length) for case, pairs in SCHEDULES.items()
+        schedule_set = INTERIOR_SCHEDULES if args.interior else DESIGN_SCHEDULES if args.design else SCHEDULES
+        schedules = [(case, gap, length) for case, pairs in schedule_set.items()
                      for gap, length in pairs] if args.all else [(args.case, args.gap, args.round_length)]
         for case, gap, length in schedules:
-            simulate(case, gap, length, args.stop_after)
+            simulate(case, gap, length, args.stop_after, args.design, args.interior)
     elif args.command == "analyse":
-        analyse()
+        if args.design:
+            from analyse_construction_design import analyse as analyse_design
+            analyse_design(design_root(args.interior))
+        else:
+            analyse()
     else:
         from compare_construction_schemes import OUT, select_under_allowances
-        data = json.loads(OUT.read_text(encoding="utf-8"))
-        schemes = data["cases"][args.case]["schemes"]
+        if args.design:
+            data = json.loads((design_root(args.interior) / "construction_choices.json").read_text(encoding="utf-8"))
+            schemes = next(t["schemes"] for t in data["tasks"]
+                           if t["case"] == args.case and t["final_face_over_a"] == 14.4)
+        else:
+            data = json.loads(OUT.read_text(encoding="utf-8"))
+            schemes = data["cases"][args.case]["schemes"]
         selection = select_under_allowances(schemes, args.convergence_mm, args.thrust_kn_per_m)
         print(json.dumps({"case": args.case, **selection,
                           "feasible_schemes": [schemes[i] for i in selection["feasible_indices"]]},
