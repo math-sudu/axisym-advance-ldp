@@ -300,7 +300,7 @@ def physical_quantities(model, displacement, face, born):
     }
 
 
-def train_increment(problem, iterations, tolerance, progress_every=200, observe=None):
+def train_increment(problem, iterations, tolerance, progress_every=200, observe=None, parameter_scale=None):
     with torch.no_grad():
         loss, residual, u, c = problem.objective()
     relative = float(residual.norm() / problem.force_scale)
@@ -309,8 +309,22 @@ def train_increment(problem, iterations, tolerance, progress_every=200, observe=
             "evaluations": 0, "loss": float(loss), "relative_force": relative,
             "converged": relative <= tolerance, "history": [], "response_history": [],
         }
+    parameters = list(problem.network.parameters())
+    if parameter_scale is not None:
+        original = torch.cat([value.detach().ravel() for value in parameters])
+        coordinate = torch.nn.Parameter(torch.zeros_like(original))
+
+        def update_parameters():
+            offset = 0
+            with torch.no_grad():
+                value = original + parameter_scale * coordinate
+                for parameter in parameters:
+                    size = parameter.numel()
+                    parameter.copy_(value[offset:offset + size].reshape_as(parameter))
+                    offset += size
+
     optimizer = torch.optim.LBFGS(
-        problem.network.parameters(), lr=1, max_iter=min(progress_every, iterations),
+        parameters if parameter_scale is None else [coordinate], lr=1, max_iter=min(progress_every, iterations),
         max_eval=progress_every * 2,
         tolerance_grad=1e-12, tolerance_change=1e-15,
         history_size=50, line_search_fn="strong_wolfe")
@@ -319,6 +333,9 @@ def train_increment(problem, iterations, tolerance, progress_every=200, observe=
     def closure():
         nonlocal evaluations
         optimizer.zero_grad()
+        if parameter_scale is not None:
+            update_parameters()
+            problem.network.zero_grad(set_to_none=True)
         loss, residual, _, _ = problem.objective()
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite neural equilibrium loss")
@@ -326,6 +343,8 @@ def train_increment(problem, iterations, tolerance, progress_every=200, observe=
         if any(p.grad is not None and not torch.isfinite(p.grad).all()
                for p in problem.network.parameters()):
             raise FloatingPointError("Nonfinite gradient through the material return")
+        if parameter_scale is not None:
+            coordinate.grad = parameter_scale * torch.cat([p.grad.ravel() for p in parameters])
         if evaluations % progress_every == 0:
             row = {"evaluation": evaluations, "loss": float(loss.detach()),
                    "relative_force": float(residual.detach().norm() / problem.force_scale)}
@@ -337,6 +356,8 @@ def train_increment(problem, iterations, tolerance, progress_every=200, observe=
     for first in range(0, iterations, progress_every):
         optimizer.param_groups[0]["max_iter"] = min(progress_every, iterations - first)
         optimizer.step(closure)
+        if parameter_scale is not None:
+            update_parameters()
         with torch.no_grad():
             loss, residual, u, c = problem.objective()
         relative = float(residual.norm() / problem.force_scale)

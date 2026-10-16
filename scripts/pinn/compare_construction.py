@@ -33,8 +33,10 @@ def compare(sources, cohort=(3.0, 6.0), face=12.0):
             numerical_history.append({
                 "round": step,
                 "release_fractions": [row["release_fraction"] for row in records],
-                "force_tolerances": [row["force_tolerance"] for row in records],
+                "force_tolerances": [row["settings"]["relative_force_tolerance"] if "settings" in row
+                                     else row["force_tolerance"] for row in records],
                 "relative_forces": [row["relative_force"] for row in records],
+                "force_stopping_met": [row["converged"] for row in records],
             })
         matched = []
         for batch in baseline["complete_batches"]:
@@ -59,12 +61,26 @@ def compare(sources, cohort=(3.0, 6.0), face=12.0):
                     "reference_hoop_strain_range": batch["post_installation_hoop_strain_range"],
                     "hoop_strain_range": other["post_installation_hoop_strain_range"],
                 })
+        reference_z = np.array([s["z_over_a"] for s in baseline["sections"]])
+        current_z = np.array([s["z_over_a"] for s in response["sections"]])
+        common = (reference_z >= current_z.min() - 1e-10) & (reference_z <= current_z.max() + 1e-10)
+        reference_profile = np.asarray(baseline["history"][-1]["hoop_thrust_kN_per_m"])[common]
+        profile = np.interp(reference_z[common], current_z, response["history"][-1]["hoop_thrust_kN_per_m"])
+        band_change = (np.asarray(response["history"][-1]["band_convergence_mm"])
+                       - baseline["history"][-1]["band_convergence_mm"])
         comparisons.append({
             "source_directory": response["source_directory"],
             "controls": response["controls"], "quantities": values,
             "numerical_history": numerical_history,
             "percent_change_from_first": changes,
             "same_centre_complete_batches": matched,
+            "final_common_sections": {
+                "definition": "Candidate profile interpolated at reference Gauss sections inside the shared sampled range; no extrapolation",
+                "z_over_a": reference_z[common].tolist(),
+                "thrust_change_kN_per_m": (profile - reference_profile).tolist(),
+                "peak_change_percent": float(100 * (profile.max() / reference_profile.max() - 1)),
+            },
+            "final_band_convergence_change_mm": band_change.tolist(),
         })
     return {
         "cohort_over_a": list(cohort), "evaluation_face_over_a": face,

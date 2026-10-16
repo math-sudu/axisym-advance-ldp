@@ -25,6 +25,9 @@ def read_state(path):
 def analyse(source, cohort=(3.0, 6.0), face=None):
     source = source.resolve()
     run = json.loads((source / "run.json").read_text(encoding="utf-8"))
+    if run.get("method") == "installation_history_constrained_neural_field_v1":
+        from history_response import analyse as analyse_history
+        return analyse_history(source, cohort, face)
     controls = run["controls"]
     length = controls["round_length_over_a"]
     last = run["last_completed_round"]

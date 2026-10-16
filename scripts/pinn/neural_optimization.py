@@ -11,6 +11,7 @@ import numpy as np
 import json
 import scipy.sparse as sp
 import torch
+from threadpoolctl import threadpool_limits
 
 
 class ReducedNeuralField(torch.nn.Module):
@@ -43,11 +44,24 @@ def neural_linearization(problem):
     _, pullback = torch.func.vjp(field, parameters)
     with torch.no_grad():
         loss, residual, displacement, _ = problem.objective()
-    tangent = reduced_tangent(problem, displacement.cpu().numpy()).tocsr()
+    tangent = reduced_tangent(problem, displacement.cpu().numpy())
     device = residual.device
-    matrix = torch.sparse_csr_tensor(tangent.indptr, tangent.indices, tangent.data,
-                                    size=tangent.shape, device=device)
-    transpose = matrix.transpose(0, 1).to_sparse_csr()
+    if sp.issparse(tangent):
+        tangent = tangent.tocsr()
+        matrix = torch.sparse_csr_tensor(tangent.indptr, tangent.indices, tangent.data,
+                                        size=tangent.shape, device=device)
+        transpose = matrix.transpose(0, 1).to_sparse_csr()
+
+        def action(vector, trans=False):
+            return torch.sparse.mm(transpose if trans else matrix, vector[:, None]).ravel()
+    else:
+        # The history-constrained field keeps its Schur action matrix-free.
+        # Neural JVP/VJP products already provide the required derivatives;
+        # this fixed physical tangent is never differentiated a second time.
+        def action(vector, trans=False):
+            values = vector.detach().cpu().numpy()
+            result = tangent.rmatvec(values) if trans else tangent.matvec(values)
+            return vector.new_tensor(result)
 
     def metric(vector):
         correction = problem.factor.solve(vector.detach().cpu().numpy())
@@ -55,13 +69,13 @@ def neural_linearization(problem):
         return vector / problem.initial_force_norm ** 2 + torch.as_tensor(scaled, device=device)
 
     def adjoint(vector):
-        cotangent = torch.sparse.mm(transpose, metric(vector)[:, None]).ravel()
+        cotangent = action(metric(vector), trans=True)
         values = pullback(cotangent)[0]
         return torch.cat([value.reshape(-1) for value in values]).detach()
 
     def normal(vector):
         _, direction = torch.func.jvp(field, (parameters,), (unflatten(vector),))
-        force = torch.sparse.mm(matrix, direction[:, None]).ravel()
+        force = action(direction)
         return adjoint(force)
 
     # The squared adjoints of independent Rademacher vectors estimate the
@@ -75,7 +89,7 @@ def neural_linearization(problem):
         scaled = problem.factor.solve(signs[1].cpu().numpy(), trans="T")
         metric_signs = (signs[0] / problem.initial_force_norm
                         + torch.as_tensor(scaled, device=device) / problem.initial_correction_norm)
-        cotangent = torch.sparse.mm(transpose, metric_signs[:, None]).ravel()
+        cotangent = action(metric_signs, trans=True)
         values = pullback(cotangent)[0]
         sample = torch.cat([value.reshape(-1) for value in values]).detach()
         diagonal += sample.square() / 8
@@ -146,6 +160,14 @@ def refine_network(problem, steps, tolerance, observe=None, cg_iterations=40):
 def head_basis(problem, face_only=False):
     """Reduced displacement Jacobian in output weight/bias storage order."""
     network = problem.network
+    if hasattr(network, "output_basis"):
+        if face_only:
+            raise ValueError("The ground field trains its complete output layer")
+        basis, parameters = network.output_basis(problem.prepared)
+        basis *= problem.displacement_scale
+        trace = sp.csr_matrix(problem.model.solver._maps["B"])
+        return sp.vstack([basis[problem.interior], trace.T @ basis[problem.if_dofs]],
+                         format="csc"), parameters
     if hasattr(network, "branches"):
         _, prepared, _ = problem.prepared
         branches = network.branches
@@ -189,6 +211,8 @@ def head_basis(problem, face_only=False):
 
 
 def reduced_tangent(problem, displacement):
+    if hasattr(problem, "tangent"):
+        return problem.tangent(displacement)
     fe = problem.model.fe
     floor = fe.tang_floor
     try:
@@ -213,7 +237,8 @@ def head_system(problem, basis):
     """Normal matrix and gradient of the existing two-term physical loss."""
     with torch.no_grad():
         loss, residual, displacement, _ = problem.objective()
-    jacobian = (reduced_tangent(problem, displacement.cpu().numpy()) @ basis).toarray()
+    tangent = reduced_tangent(problem, displacement.cpu().numpy())
+    jacobian = (tangent @ basis).toarray() if sp.issparse(tangent) else tangent @ basis.toarray()
     scaled = problem.factor.solve(jacobian)
     correction = problem.factor.solve(residual.cpu().numpy())
     device = residual.device
@@ -225,17 +250,54 @@ def head_system(problem, basis):
     return normal, gradient, float(loss), float(residual.norm() / problem.force_scale)
 
 
-def refine_head(problem, steps, tolerance, observe=None, face_only=False):
+def head_residual_jacobian(problem, basis):
+    """Weighted least-squares system before forming normal equations."""
+    # SuperLU's many small dense kernels suffer from nested BLAS threading.
+    # The subsequent large dense least-squares solve uses the caller's threads.
+    with threadpool_limits(limits=1, user_api="blas"):
+        with torch.no_grad():
+            loss, residual, displacement, _ = problem.objective()
+        force = residual.cpu().numpy()
+        tangent = reduced_tangent(problem, displacement.cpu().numpy())
+        jacobian = (tangent @ basis).toarray() if sp.issparse(tangent) else tangent @ basis.toarray()
+        matrix = np.vstack([jacobian / problem.initial_force_norm,
+                            problem.factor.solve(jacobian) / problem.initial_correction_norm])
+        error = np.r_[force / problem.initial_force_norm,
+                      problem.factor.solve(force) / problem.initial_correction_norm]
+    return matrix, error, float(loss), float(residual.norm() / problem.force_scale)
+
+
+def refine_head(problem, steps, tolerance, observe=None, face_only=False, solver="damped", rcond=1e-9):
+    if steps == 0:
+        return []
+    with torch.no_grad():
+        if float(problem.residual()[0].norm() / problem.force_scale) <= tolerance:
+            return []
     basis, parameters = head_basis(problem, face_only)
     damping, history = 1e-4, []
     for iteration in range(steps):
-        normal, gradient, loss_before, relative_before = head_system(problem, basis)
+        if solver == "svd":
+            matrix, error, loss_before, relative_before = head_residual_jacobian(problem, basis)
+        elif solver == "damped":
+            normal, gradient, loss_before, relative_before = head_system(problem, basis)
+        else:
+            raise ValueError("Unknown output-layer solver")
         if relative_before <= tolerance:
             break
         original = torch.cat([p.detach().reshape(-1) for p in parameters])
-        diagonal = torch.arange(len(gradient), device=gradient.device)
-        normal[diagonal, diagonal] += damping * normal.diagonal().max()
-        delta = torch.linalg.solve(normal, -gradient)
+        if solver == "svd":
+            scale = np.linalg.norm(matrix, axis=0)
+            scale = np.maximum(scale, np.sqrt(np.finfo(float).eps) * scale.max())
+            result = torch.linalg.lstsq(torch.from_numpy(matrix / scale), torch.from_numpy(-error),
+                                        rcond=rcond, driver="gelsd")
+            delta = original.new_tensor(result.solution.numpy() / scale)
+            rank = result.rank.item()
+        else:
+            diagonal = torch.arange(len(gradient), device=gradient.device)
+            scale = normal.diagonal().clamp_min(torch.finfo(normal.dtype).eps * normal.diagonal().max()).sqrt()
+            normal = normal / scale[:, None] / scale[None, :]
+            normal[diagonal, diagonal] += damping
+            delta = torch.linalg.solve(normal, -gradient / scale) / scale
         accepted = False
         with torch.no_grad():
             for backtrack in range(16):
@@ -258,7 +320,8 @@ def refine_head(problem, steps, tolerance, observe=None, face_only=False):
                 break
         row = {"iteration": iteration + 1, "loss": float(loss),
                "relative_force": float(residual.norm() / problem.force_scale),
-               "step_fraction": 0.5 ** backtrack, "damping": damping}
+               "step_fraction": 0.5 ** backtrack, "solver": solver}
+        row.update({"rank": int(rank), "rcond": rcond} if solver == "svd" else {"damping": damping})
         if observe is not None:
             row.update(observe(u.cpu().numpy()))
         history.append(row)

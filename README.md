@@ -1,154 +1,197 @@
-# Tunnel convergence and lining thrust with FEINNs
+# Tunnel convergence and lining thrust with neural fields
 
 Code and data-generation scripts for **Tunnel convergence and lining thrust
-under staged excavation using physics-informed neural networks**, by
+under staged excavation using physics-informed neural fields**, by
 Pengcheng Zhu and Tielin Chen.
 
-The finite element-integrated neural network (FEINN) predicts displacement
-increments. Axisymmetric quadrature, a non-associated Mohr--Coulomb return
-map and an elastic exterior supply the weak equilibrium residual. Each
-accepted increment commits the material history. Bonded lining is activated
-stress-free and subsequently responds to strain relative to installation.
-The common initial equilibrium is generated with the conventional solver;
-excavation and installation after that state use neural equilibrium.
+The neural field represents ground displacement increments. Complete
+installation references enter an affine support operator: the connected
+elastic lining is condensed, and its displacement and stress are recovered
+during each trial. Axisymmetric weak equilibrium, non-associated
+Mohr--Coulomb integration and an elastic exterior govern training. Material
+and installation histories change only when an increment is accepted.
 
-## Install
+## Install and generate the physical initial state
 
-Tested with Python 3.13. From this checkout:
+Tested with Python 3.13. Create and activate a virtual environment, then install:
 
-```text
+~~~text
 python -m venv .venv
-```
-
-Activate it with `.venv\Scripts\Activate.ps1` in PowerShell or
-`source .venv/bin/activate` on Linux/macOS, then install:
-
-```text
 python -m pip install -r requirements.txt
-```
+~~~
 
-CPU is the default. `--device cuda` selects a CUDA-capable PyTorch installation.
-Calculations use float64. `--cpu-threads` sets PyTorch's CPU thread count.
-Run the initial-state generator once before launching histories on that mesh.
-Generated states, neural weights and readouts stay under ignored `results/`.
+Between these commands, activate with `.venv\Scripts\Activate.ps1` in
+PowerShell or `source .venv/bin/activate` on Linux/macOS. CPU is the default;
+`--device cuda` requires a CUDA-capable PyTorch installation. Training uses
+float64. `--cpu-threads` controls the CPU and BLAS thread budget.
 
-## Check the installation
+Generate each required common equilibrium before starting a history:
 
-Generate a small common equilibrium and run the neural and readout tests:
-
-```text
+~~~text
 python -B scripts/pinn/initialize.py --mesh coarse
+python -B scripts/pinn/initialize.py --mesh production
+python -B scripts/pinn/initialize.py --mesh design
+~~~
+
+The conventional initializer supplies only the common physical state, with
+the face at zero and the lining front at `z/a=-1`. Subsequent excavation and
+installation use the neural solver. `production` has 7,995 nodes and 7,760
+elements, with `0.1a` axial spacing. `design` uses `0.05a` axial spacing and
+the same radial grid. `coarse` is useful for installation checks; its `0.2a`
+spacing cannot represent the `0.7a` installation gap. Generated inputs,
+fields and checkpoints stay under ignored `results/`.
+
+## Check execution and physical readout
+
+The first two initial states above are required by the tests:
+
+~~~text
 python -B -m unittest discover -s scripts/pinn -p "test_*.py"
 python -B -m unittest discover -s scripts/review -p "test_*.py"
-```
+~~~
 
-These checks exercise neural gradients, zero-stress activation, frozen material
-history, thrust quadrature, installation-relative strain, and joint checkpoint
-restart. The integration test deliberately accepts a small training budget to
-test state transport and preserves its actual non-convergence flag.
+Tests cover same-field support assembly, complete references, zero-stress
+installation, neural derivatives, frozen material history, acceptance and
+restart, thrust integration and strain contributions. A small two-round
+run also exercises the command-line interface:
 
-A short standalone run exercises the same command interface as full training:
+~~~text
+python -B scripts/pinn/run_history_construction.py --mesh coarse --width 6 --rounds 2 --face-patch-span 0.2 --front-local --support-patch-span 0.4 --support-local --release-step 0.5 --head-steps 1 --head-solver svd --head-rcond 1e-11 --gauss-newton-steps 0 --iterations 0 --tolerance 1e-12 --accept-training-limit --archive-rounds 2 --output results/history_smoke
+python -B scripts/pinn/construction_response.py --source results/history_smoke --cohort -1 -0.2 --face 0.8
+python -B scripts/pinn/compare_construction.py --sources results/history_smoke --cohort -1 -0.2 --face 0.8 --output results/history_smoke/comparison.json
+~~~
 
-```text
-python -B scripts/pinn/run_construction.py --mesh coarse --architecture face-local --reuse-increment --rounds 1 --release-step 0.5 --gauss-newton-steps 2 --cg-iterations 20 --iterations 1 --tolerance 0.0003 --accept-training-limit --archive-rounds 1 --output results/neural_smoke
-python -B scripts/pinn/construction_response.py --source results/neural_smoke --cohort -1 -0.6 --face 0.4
-python -B scripts/pinn/compare_construction.py --sources results/neural_smoke --cohort -1 -0.6 --face 0.4 --output results/neural_smoke/comparison.json
-python -B scripts/pinn/section_strains.py --source results/neural_smoke/comparison.json --output results/neural_smoke/strains.json
-```
+This short run tests execution with deliberate training-budget acceptance.
+`accepted` records physical commitment; `converged` records whether the force
+stopping setting was met. Without `--accept-training-limit`, a failed trial
+returns exit code 2 and preserves the last accepted material state. Repeat a
+training command with `--resume` to restore its state, or increase `--rounds`
+to continue it. Use a new output directory for a new run. `--resume-from`
+branches from an explicit saved checkpoint and retains its parent-field link.
 
-The short run verifies execution and readout, not the manuscript's numerical
-response. Repeat its training command with `--resume` to restore the joint
-state. Increase `--rounds` to continue excavation. A new run needs a new output
-directory; restarting an existing run requires `--resume`.
+## Train the three construction schedules from scratch
 
-## Generate neural construction histories
+These commands start with the same seeded, untrained network on each mesh.
+They use the final representation and regular controls of the study:
 
-The manuscript mesh has 7,995 nodes and 7,760 elements. Generate its initial
-equilibrium, then train the three schedules from fresh networks:
+~~~text
+python -B scripts/pinn/run_history_construction.py --mesh production --rounds 15 --round-length 0.4 --gap 0.6 --face-patch-span 0.2 --front-local --support-patch-span 0.4 --support-local --release-step 0.5 --head-steps 6 --head-solver svd --head-rcond 1e-11 --gauss-newton-steps 0 --iterations 0 --tolerance 0.0006 --accept-training-limit --cpu-threads 8 --archive-rounds 10 12 15 --output results/history_production_g0p6_l0p4
+python -B scripts/pinn/run_history_construction.py --mesh production --rounds 30 --round-length 0.2 --gap 0.7 --face-patch-span 0.2 --front-local --support-patch-span 0.4 --support-local --release-step 0.5 --head-steps 6 --head-solver svd --head-rcond 1e-11 --gauss-newton-steps 0 --iterations 0 --tolerance 0.0004 --accept-training-limit --cpu-threads 8 --archive-rounds 20 24 30 --output results/history_production_g0p7_l0p2
+python -B scripts/pinn/run_history_construction.py --mesh production --rounds 30 --round-length 0.2 --gap 0.8 --face-patch-span 0.2 --front-local --support-patch-span 0.4 --support-local --release-step 0.5 --head-steps 6 --head-solver svd --head-rcond 1e-11 --gauss-newton-steps 0 --iterations 0 --tolerance 0.0004 --accept-training-limit --cpu-threads 8 --archive-rounds 20 24 30 --output results/history_production_g0p8_l0p2
+~~~
 
-```text
-python -B scripts/pinn/initialize.py --mesh production
-python -B scripts/pinn/run_construction.py --mesh production --architecture face-local --reuse-increment --rounds 30 --round-length 0.4 --gap 0.6 --release-step 0.5 --gauss-newton-steps 20 --cg-iterations 160 --iterations 0 --tolerance 0.0006 --accept-training-limit --archive-rounds 20 30 --output results/neural_g0p6_l0p4
-python -B scripts/pinn/run_construction.py --mesh production --architecture face-local --reuse-increment --rounds 60 --round-length 0.2 --gap 0.7 --release-step 0.5 --gauss-newton-steps 20 --cg-iterations 160 --iterations 0 --tolerance 0.0005 --accept-training-limit --archive-rounds 16 40 60 --output results/neural_g0p7_l0p2
-python -B scripts/pinn/run_construction.py --mesh production --architecture face-local --reuse-increment --rounds 60 --round-length 0.2 --gap 0.8 --release-step 0.5 --gauss-newton-steps 20 --cg-iterations 160 --iterations 0 --tolerance 0.0005 --accept-training-limit --archive-rounds 40 60 --output results/neural_g0p8_l0p2
-```
+Repeat with `--mesh design` and `history_design_...` output names for the
+paired grid. These are substantial training jobs; `--rounds 1` exercises a
+shorter run. `--head-steps` applies before and after the full-network stage.
+Every attempt records its controls, force residual, acceptance and response
+in `run.json`. Assess a new run's physical responses with training, release
+and spatial checks appropriate to its conclusions.
 
-Each `run.json` records accepted release fractions, force residuals, optimization
-traces and physical responses. `accepted` means the material state was committed;
-`converged` means the chosen force tolerance was met. `--accept-training-limit`
-permits commitment at the training limit and retains both flags. Assess the
-physical responses with additional training and finer releases when needed.
-Omitting that flag stops with exit code 2 at an unaccepted trial; `--resume`
-continues it with the original frozen material state. Full training can take
-many hours; `--rounds 1` provides a shorter production-mesh run.
+### Initialization of the reported histories
 
-These commands regenerate the model and construction schedules with the final
-regular training controls. The reported histories used transferred initial
-weights and earlier startup controls: the long-round history began with eight
-releases in its first round, the same-centre short history used eight releases
-in its first two rounds, and the rearward-installation history transferred
-weights from the short-round startup refinement. Thus a fresh-network run is
-not a replay of those optimization trajectories, and the rounded manuscript
-values below are reference results rather than an exact-output test. The code
-supports `--initial-network`, incremental `--resume`, and changing subsequent
-training/release controls. Generated research checkpoints are not release inputs.
+The six reported histories used transferred neural parameters, separately
+from their regenerated physical initial states. The transfer chain was:
 
-## Read the physical response
+1. A two-round coarse history trained a width-32, seed-17 network using
+   Gauss--Newton and L-BFGS, with half releases and a `5e-4` force setting.
+2. Its parameters initialized a production-grid startup trial. Face and
+   support-front windows were added during that diagnostic, preserving the
+   existing field. The shared parameter source was its **unaccepted** trial
+   at round 1, release fraction 1, with a `0.2a` face window, local face
+   coordinates and a `0.4a` support-front window.
+3. All six final histories restored their own common physical initial state,
+   loaded these same parameters and added zero-output annular branches.
+   No material state or installation reference was transferred from the trial.
 
-After completing the three histories:
+The research source is `control_B_g0p6_round0p4_production_local/checkpoint.pt`,
+from which the parameter-only `spatial_initial_network.pt` was extracted.
+These generated weights and the original fields are not included in this
+source release. `--initial-network` accepts a locally generated history
+checkpoint and transfers its parameters alone; `--resume` restores the full
+physical and neural state. Seed 17 alone does not reconstruct the trained source.
 
-```text
-python -B scripts/pinn/compare_construction.py --sources results/neural_g0p6_l0p4 results/neural_g0p7_l0p2 results/neural_g0p8_l0p2 --cohort 3 6 --face 12 --output results/representative_history_comparison.json
-python -B scripts/pinn/section_strains.py --source results/representative_history_comparison.json --output results/representative_section_strains.json
-```
+The production long-round history initially used `3e-4`, accepted its second
+round's final trial after a resume at `3.2e-4`, then used `4e-4` and `5e-4`
+before the final `6e-4` setting. Early production steps used six SVD head
+updates on each side of up to eight full-network updates, with `rcond=1e-9`.
+The final `rcond=1e-11`, head-only controls began at round 6/release 1 for
+the long schedule, round 11/release 1 for `(0.7,0.2)` and round 6/release 1
+for `(0.8,0.2)`. The design histories used the final head-only controls
+throughout, with CPU thread counts changing from 6 to 4 to 8. The SVD
+implementation also changed during development. Original attempts and
+controls remain in each research `run.json`.
 
-The comparison uses the same material interval `z/a=[3,6]` in every run.
-It retains fixed sections, complete installation batches and matched-centre
-batch pairs. Convergence is averaged over fixed `0.2a` bands; thrust integrates
-hoop stress through thickness without a radius factor. Strain decomposition
-reconstructs stress from each section's actual installation displacement and
-checks radial, axial and hoop contributions against the saved thrust.
+Consequently, the fresh commands above reproduce the model and schedules,
+not the historical optimization trajectories or the exact table values.
+The table below reports the original six histories. The released readout
+functions can analyse either newly generated fields or those original fields
+when provided locally in their recorded directory structure.
 
-Reported reference responses for the three completed neural histories:
+## Read distributions, complete batches and paired spatial effects
 
-| Gap/radius | Round/radius | Convergence envelope (mm) | Mean thrust at 12a (kN/m) | Section-thrust envelope (kN/m) |
-|---:|---:|---:|---:|---:|
-| 0.6 | 0.4 | 10.933 | 1618.3 | 2163.6 |
-| 0.7 | 0.2 | 10.619 | 1656.1 | 1864.5 |
-| 0.8 | 0.2 | 11.044 | 1514.8 | 1695.0 |
+After completing each set of three histories:
 
-For a frozen-increment training check, retain the final-release checkpoints
-with `--archive-rounds`, then run, for example:
+~~~text
+python -B scripts/pinn/compare_construction.py --sources results/history_production_g0p6_l0p4 results/history_production_g0p7_l0p2 results/history_production_g0p8_l0p2 --cohort 1.4 3.4 --face 6 --output results/production_comparison.json
+python -B scripts/pinn/compare_construction.py --sources results/history_design_g0p6_l0p4 results/history_design_g0p7_l0p2 results/history_design_g0p8_l0p2 --cohort 1.4 3.4 --face 6 --output results/design_comparison.json
+python -B scripts/pinn/compare_paired_space.py --reference results/production_comparison.json --candidate results/design_comparison.json --output results/paired_comparison.json
+~~~
 
-```text
-python -B scripts/pinn/refine_release.py --checkpoint results/neural_g0p7_l0p2/round-060-before-final.pt --trained-checkpoint results/neural_g0p7_l0p2/round-060-checkpoint.pt --release 1 --steps 40 --cg-iterations 160 --tolerance 0.0002 --cohort 3 6 --output results/neural_g0p7_l0p2/final_refinement
-```
+The common material interval is `z/a=[1.4,3.4]`. Readout reconstructs lining
+stress from the **complete** saved reference biases and checks against the
+stored stress. Each response includes radial, axial and hoop thrust
+contributions in `history`, fixed material sections, `0.2a` convergence
+bands and complete batches with their actual bounds. An interval peak can
+belong to a boundary-intersecting batch; complete-batch maxima use the full
+batch. Paired profiles interpolate only inside each batch and both sampled
+extents. The older `section_strains.py` serves the preceding FEINN method;
+use the history response's embedded components for the current method.
 
-This saves separate refined fields and leaves the accepted history intact.
-A release sensitivity run uses a separate output directory and a smaller
-`--release-step`; compare its completed fields at the same face and cohort.
+Original finite-advance results at `6a`:
+
+| Mesh | `(gap/a, round/a)` | Convergence envelope (mm) | Mean thrust (kN/m) | Peak thrust (kN/m) |
+|---|---|---:|---:|---:|
+| production | (0.6, 0.4) | 10.89048 | 1503.432 | 2095.533 |
+| production | (0.7, 0.2) | 10.41434 | 1528.558 | 1759.680 |
+| production | (0.8, 0.2) | 10.85777 | 1393.335 | 1615.281 |
+| design | (0.6, 0.4) | 10.12410 | 1515.981 | 2161.808 |
+| design | (0.7, 0.2) | 10.13305 | 1515.943 | 1826.891 |
+| design | (0.8, 0.2) | 10.66540 | 1382.003 | 1661.607 |
+
+The short-round peak reduction and rearward-installation trade-off persist
+on both grids. Small shortening-induced convergence and mean-load changes
+do not retain their signs. The interval still loads between `4.8a` and `6a`.
+
+For a frozen final-release training check, using the archived checkpoints:
+
+~~~text
+python -B scripts/pinn/refine_history.py --checkpoint results/history_production_g0p7_l0p2/round-030-before-final.pt --accepted-checkpoint results/history_production_g0p7_l0p2/round-030-checkpoint.pt --head-steps 4 --head-solver svd --head-rcond 1e-12 --gauss-newton-steps 4 --cg-iterations 100 --iterations 0 --tolerance 0.00001 --cpu-threads 8 --output results/history_production_g0p7_l0p2/final_refinement
+~~~
+
+This writes separate refined fields and leaves the accepted history intact.
+`compare_history_controls.py` compares accepted checkpoint fields at identical
+fronts. A release check uses a separate history with a smaller `--release-step`.
 
 ## Model and source
 
-The tunnel radius is 2 m and initial hydrostatic compression is 5 MPa.
-Rock modulus is 1800 MPa, Poisson ratio 0.30, cohesion 0.50 MPa, friction
-30 degrees and dilation zero. Lining thickness is 0.2 m, modulus 18000 MPa
-and Poisson ratio 0.20. Every schedule starts with the face at zero and
-the lining front at `z/a=-1`. `--gap` is the minimum forward-edge distance
-at installation; batch-centre distance is `gap + round_length/2`.
-Displacements are in metres and tension-positive stresses in MPa internally;
-the readouts report inward convergence and compression as positive.
+Tunnel radius is 2 m; initial hydrostatic compression is 5 MPa. Rock modulus
+is 1800 MPa, Poisson ratio 0.30, cohesion 0.50 MPa, friction 30 degrees and
+dilation zero. Lining thickness is 0.2 m, modulus 18000 MPa and Poisson ratio
+0.20. `--gap` is the minimum forward-edge distance at installation; the
+batch-centre distance is `gap + round_length/2`. Internal displacements are
+metres and tension-positive stresses are MPa; readouts use inward convergence
+and compressive thrust as positive.
 
-`scripts/pinn/` contains the neural solver, initialization and readouts.
-`src/` contains the material, finite-element and exterior kernels and the
-initial-equilibrium solver. The numerical neural bodies and readout functions
-are exported from the research implementation; package wiring uses local
-modules and generates its initial state without the research checkout.
-The retained `reproduce.py` and [earlier study commands](LEGACY.md) reproduce
-the preceding conventional construction study.
+`scripts/pinn/` contains the neural methods, initializer and readouts. `src/`
+contains material, finite-element and exterior kernels. Numerical function
+bodies are exported from the research implementation; module wiring uses
+only this package. Existing `run_construction.py` and `refine_release.py`
+remain the earlier FEINN implementation. `reproduce.py` and [LEGACY.md](LEGACY.md)
+serve the preceding conventional study.
 
-The FEINN formulation follows Zhang et al.,
+Weak neural equilibrium follows Zhang et al.,
 [CMA 433, 117474](https://doi.org/10.1016/j.cma.2024.117474) and
 [IJMS 290, 110075](https://doi.org/10.1016/j.ijmecsci.2025.110075).
-This implementation uses axisymmetric weak equilibrium and the stated
-non-associated rock law; no displacement or stress labels enter training.
+No displacement or stress labels enter training. The current implementation
+retains each lining batch's complete installation reference while coupling
+the connected support to the neural ground increments.
